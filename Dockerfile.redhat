@@ -6,6 +6,8 @@
 
 FROM registry.access.redhat.com/ubi8/go-toolset:1.22 AS build
 
+ARG version=v1.10.0
+
 USER root
 ENV PATH="${PATH}:/opt/rh/go-toolset-1.22/root/usr/bin/"
 RUN printenv
@@ -18,9 +20,7 @@ COPY cmd cmd
 COPY pkg pkg
 COPY Makefile ./
 
-RUN echo -e "package common\nconst Version = \"${version}\"" > ./pkg/common/version.go
-
-RUN make controller node; cp seagate-exos-x-csi-controller seagate-exos-x-csi-node /
+RUN make VERSION="${version}" controller node; cp seagate-exos-x-csi-controller seagate-exos-x-csi-node /
 
 RUN ls -l /
 
