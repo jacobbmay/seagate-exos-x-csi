@@ -1,5 +1,11 @@
 # Troubleshooting
 
+## Fresh iSCSI node fails with "specified initiator for mapping not found"
+
+The controller automatically registers a deterministic nickname for a new node's iSCSI initiator before mapping its first volume. This allows a fresh node to attach its first volume without running `iscsiadm` discovery manually.
+
+If registration fails, verify that the controller can reach and authenticate to the storage management API, then inspect the controller logs for `failed to register iSCSI initiator`. The node's initiator is read from `/etc/iscsi/initiatorname.iscsi`.
+
 ## Fixing iSCSI/multipathd state
 
 It might happen that your iSCSI devices/sessions/whatever are in a bad state, for instance the multipath device `/dev/dm-x` might be missing.
