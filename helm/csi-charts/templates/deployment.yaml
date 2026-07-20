@@ -28,6 +28,12 @@ spec:
           command:
             - seagate-exos-x-csi-controller
             - -bind=unix:///csi/csi.sock
+{{- if .Values.controller.tls.insecureSkipVerify }}
+            - -insecure-skip-tls-verify=true
+{{- end }}
+{{- if or .Values.controller.tls.caBundle .Values.controller.tls.existingConfigMap .Values.controller.tls.existingSecret }}
+            - -ca-bundle=/etc/seagate-exos-x-csi/tls/ca.crt
+{{- end }}
 {{- include "csidriver.extraArgs" .Values.controller | indent 10 }}
           env:
             - name: CSI_NODE_SERVICE_PORT
@@ -37,6 +43,11 @@ spec:
               mountPath: /csi
             - name: csi-run-dir
               mountPath: /var/run/csi-exos-x.seagate.com
+{{- if or .Values.controller.tls.caBundle .Values.controller.tls.existingConfigMap .Values.controller.tls.existingSecret }}
+            - name: storage-api-ca
+              mountPath: /etc/seagate-exos-x-csi/tls
+              readOnly: true
+{{- end }}
           ports:
             - containerPort: 9842
               name: metrics
@@ -92,3 +103,19 @@ spec:
         - name: csi-run-dir
           hostPath:
             path: /var/run/csi-exos-x.seagate.com
+{{- if or .Values.controller.tls.caBundle .Values.controller.tls.existingConfigMap .Values.controller.tls.existingSecret }}
+        - name: storage-api-ca
+{{- if .Values.controller.tls.caBundle }}
+          configMap:
+            name: {{ include "csidriver.caBundleName" . }}
+{{- else if .Values.controller.tls.existingConfigMap }}
+          configMap:
+            name: {{ .Values.controller.tls.existingConfigMap }}
+{{- else }}
+          secret:
+            secretName: {{ .Values.controller.tls.existingSecret }}
+{{- end }}
+          items:
+            - key: {{ .Values.controller.tls.key }}
+              path: ca.crt
+{{- end }}

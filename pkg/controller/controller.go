@@ -2,12 +2,16 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	storageapi "github.com/Seagate/seagate-exos-x-api-go/v2/pkg/api"
 	"github.com/Seagate/seagate-exos-x-api-go/v2/pkg/client"
@@ -66,9 +70,35 @@ type DriverCtx struct {
 	VolumeCaps  *[]*csi.VolumeCapability
 }
 
+// TLSConfig controls certificate verification for storage API HTTPS endpoints.
+type TLSConfig struct {
+	InsecureSkipVerify bool
+	CABundlePath       string
+}
+
 // New is a convenience fn for creating a controller driver
 func New() *Controller {
+	controller, err := NewWithTLSConfig(TLSConfig{})
+	if err != nil {
+		panic(err)
+	}
+	return controller
+}
+
+// NewWithTLSConfig creates a controller with the requested storage API TLS settings.
+func NewWithTLSConfig(tlsConfig TLSConfig) (*Controller, error) {
+	httpClient, err := newStorageAPIHTTPClient(tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+
 	client := storageapi.NewClient()
+	client.HTTPClient = *httpClient
+	// seagate-exos-x-api-go v2.4.1 uses http.DefaultClient while constructing
+	// its generated client during login. Point it at the same configured client
+	// so login and all subsequent requests use identical TLS settings.
+	http.DefaultClient = &client.HTTPClient
+
 	controller := &Controller{
 		Driver:             common.NewDriver(client.Collector),
 		client:             client,
@@ -131,7 +161,30 @@ func New() *Controller {
 		controller.Stop()
 	}()
 
-	return controller
+	return controller, nil
+}
+
+func newStorageAPIHTTPClient(config TLSConfig) (*http.Client, error) {
+	tlsConfig := &tls.Config{InsecureSkipVerify: config.InsecureSkipVerify} // #nosec G402 -- explicitly controlled by the administrator
+
+	if config.CABundlePath != "" {
+		caBundle, err := os.ReadFile(config.CABundlePath)
+		if err != nil {
+			return nil, fmt.Errorf("read CA bundle %q: %w", config.CABundlePath, err)
+		}
+		rootCAs, err := x509.SystemCertPool()
+		if err != nil || rootCAs == nil {
+			rootCAs = x509.NewCertPool()
+		}
+		if ok := rootCAs.AppendCertsFromPEM(caBundle); !ok {
+			return nil, fmt.Errorf("CA bundle %q contains no valid PEM certificates", config.CABundlePath)
+		}
+		tlsConfig.RootCAs = rootCAs
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsConfig
+	return &http.Client{Transport: transport, Timeout: 15 * time.Second}, nil
 }
 
 // ControllerGetCapabilities returns the capabilities of the controller service.

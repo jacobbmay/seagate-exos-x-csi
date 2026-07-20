@@ -57,6 +57,17 @@ csiNodeRegistrar:
 controller:
   # -- Extra arguments for seagate-exos-x-csi-controller container
   extraArgs: [-v=0]
+  tls:
+    # -- Disable certificate validation for storage API HTTPS endpoints. This is insecure and should only be used for testing.
+    insecureSkipVerify: false
+    # -- PEM-encoded CA certificates to trust in addition to the container's system roots.
+    caBundle: ""
+    # -- Existing ConfigMap containing a CA bundle. Ignored when caBundle is set.
+    existingConfigMap: ""
+    # -- Existing Secret containing a CA bundle. Ignored when caBundle or existingConfigMap is set.
+    existingSecret: ""
+    # -- Key containing the CA bundle in the generated/existing ConfigMap or Secret.
+    key: ca.crt
 node:
   # -- Extra arguments for seagate-exos-x-csi-node containers
   extraArgs: [-v=0]

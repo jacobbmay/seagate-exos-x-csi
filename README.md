@@ -117,6 +117,25 @@ oc adm policy add-scc-to-user exos-x-csi-access -z csi-provisioner -n NAMESPACE
 - Update `example/storageclass-example1.yaml` with your storage controller values. Use `example/storageclass-example2-CHAP.yaml` if you are using CHAP authentication
 - Update `example/testpod-example1.yaml` with any of you new values.
 
+#### HTTPS storage API endpoints
+
+TLS certificates are validated by default. To trust an internal CA, pass a PEM bundle to the controller through Helm:
+
+```yaml
+controller:
+  tls:
+    caBundle: |
+      -----BEGIN CERTIFICATE-----
+      ...
+      -----END CERTIFICATE-----
+```
+
+The chart can instead mount an existing ConfigMap or Secret by setting `controller.tls.existingConfigMap` or `controller.tls.existingSecret`; the bundle key defaults to `ca.crt` and can be changed with `controller.tls.key`. Only the controller pod calls the storage API, so node pods do not require this bundle.
+
+For test environments with certificates that cannot be validated, set `controller.tls.insecureSkipVerify: true`. This disables server identity verification and is not recommended for production.
+
+When running the controller without Helm, the equivalent flags are `-ca-bundle=/path/to/ca.pem` and `-insecure-skip-tls-verify=true`.
+
 ## Documentation
 
 You can find more documentation in the [docs](./docs) directory.

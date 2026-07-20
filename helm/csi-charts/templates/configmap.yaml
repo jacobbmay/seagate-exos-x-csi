@@ -1,0 +1,11 @@
+{{- if .Values.controller.tls.caBundle }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "csidriver.caBundleName" . }}
+  labels:
+{{ include "csidriver.labels" . | indent 4 }}
+data:
+  {{ .Values.controller.tls.key }}: |
+{{ .Values.controller.tls.caBundle | indent 4 }}
+{{- end }}
