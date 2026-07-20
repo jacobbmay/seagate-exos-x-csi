@@ -23,7 +23,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -325,6 +327,95 @@ func Unmount(path string) error {
 		klog.ErrorS(err, "assuming that volume is already unmounted")
 	}
 	return nil
+}
+
+// IsKubeletBlockVolumeTarget reports whether path is a per-pod raw block
+// publication target in kubelet's CSI volumeDevices tree.
+func IsKubeletBlockVolumeTarget(path string) bool {
+	cleanPath := filepath.Clean(path)
+	marker := string(os.PathSeparator) + filepath.Join("plugins", "kubernetes.io", "csi", "volumeDevices", "publish") + string(os.PathSeparator)
+	markerIndex := strings.Index(cleanPath, marker)
+	if markerIndex < 0 {
+		return false
+	}
+
+	relativeTarget := cleanPath[markerIndex+len(marker):]
+	parts := strings.Split(relativeTarget, string(os.PathSeparator))
+	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+}
+
+// HasOtherBlockVolumePublications checks for another active raw block bind
+// mount for the same volume. Kubelet stores every per-pod target for a volume
+// as a sibling beneath the same volumeDevices/publish directory.
+func HasOtherBlockVolumePublications(targetPath string) (bool, error) {
+	return hasOtherBlockVolumePublications(targetPath, isActiveBlockTarget)
+}
+
+func hasOtherBlockVolumePublications(targetPath string, isActive func(string) (bool, error)) (bool, error) {
+	cleanTarget := filepath.Clean(targetPath)
+	publicationDir := filepath.Dir(cleanTarget)
+	entries, err := os.ReadDir(publicationDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect raw block publications in %q: %w", publicationDir, err)
+	}
+
+	for _, entry := range entries {
+		candidate := filepath.Join(publicationDir, entry.Name())
+		if candidate == cleanTarget {
+			continue
+		}
+
+		active, err := isActive(candidate)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return false, fmt.Errorf("inspect raw block publication %q: %w", candidate, err)
+		}
+		if active {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func isActiveBlockTarget(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+
+	mode := info.Mode()
+	return mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0, nil
+}
+
+// IsMultipathDeviceOpen returns true when device-mapper reports one or more
+// open references. Disconnecting an open map is unsafe because the iSCSI
+// library force-removes it, which can replace the live map with an error table.
+func IsMultipathDeviceOpen(devicePath string) (bool, error) {
+	output, err := exec.Command("dmsetup", "info", "--columns", "--noheadings", "--options", "open", devicePath).CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("query open count for multipath device %q: %s (%w)", devicePath, strings.TrimSpace(string(output)), err)
+	}
+
+	return parseMultipathOpenCount(output)
+}
+
+func parseMultipathOpenCount(output []byte) (bool, error) {
+	fields := strings.Fields(string(output))
+	if len(fields) != 1 {
+		return false, fmt.Errorf("unexpected dmsetup open count output %q", strings.TrimSpace(string(output)))
+	}
+
+	openCount, err := strconv.ParseUint(fields[0], 10, 64)
+	if err != nil {
+		return false, fmt.Errorf("parse dmsetup open count %q: %w", fields[0], err)
+	}
+	return openCount > 0, nil
 }
 
 // IsVolumeInUse: Use findmnt to determine if the device path is mounted or not.

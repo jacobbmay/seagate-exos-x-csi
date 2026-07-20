@@ -247,13 +247,52 @@ func (node *Node) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublis
 		klog.ErrorS(err, "Error creating storage node")
 		return nil, status.Errorf(codes.Internal, "unable to create storage node")
 	}
-	storage.Unmount(req.GetTargetPath())
-	err = storageNode.DetachStorage(ctx, req)
+	err = unpublishTarget(req.GetTargetPath(), func() error {
+		return storageNode.DetachStorage(ctx, req)
+	})
 	if err != nil {
+		if _, isStatusError := status.FromError(err); isStatusError {
+			return nil, err
+		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+func unpublishTarget(targetPath string, detach func() error) error {
+	return unpublishTargetWithOperations(
+		targetPath,
+		storage.Unmount,
+		storage.HasOtherBlockVolumePublications,
+		detach,
+	)
+}
+
+func unpublishTargetWithOperations(
+	targetPath string,
+	unmount func(string) error,
+	hasOtherBlockPublications func(string) (bool, error),
+	detach func() error,
+) error {
+	if err := unmount(targetPath); err != nil {
+		return err
+	}
+
+	if storage.IsKubeletBlockVolumeTarget(targetPath) {
+		hasOther, err := hasOtherBlockPublications(targetPath)
+		if err != nil {
+			// A failed inspection is not proof that the device is unused. Keep
+			// it attached so a cleanup retry cannot disrupt a live workload.
+			return err
+		}
+		if hasOther {
+			klog.InfoS("raw block volume still has another active publication; keeping storage attached", "targetPath", targetPath)
+			return nil
+		}
+	}
+
+	return detach()
 }
 
 // NodeExpandVolume finalizes volume expansion on the node

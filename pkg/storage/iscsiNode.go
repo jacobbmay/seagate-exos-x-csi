@@ -191,6 +191,18 @@ func (iscsi *iscsiStorage) DetachStorage(ctx context.Context, req *csi.NodeUnpub
 		return nil
 	}
 
+	if connector.Multipath {
+		deviceOpen, err := IsMultipathDeviceOpen(connector.DevicePath)
+		if err != nil {
+			// Failing closed is safer than allowing DisconnectVolume to force
+			// remove a map whose open state could not be established.
+			return status.Error(codes.Aborted, err.Error())
+		}
+		if deviceOpen {
+			return status.Errorf(codes.Aborted, "multipath device %s is still open; keeping it attached", connector.DevicePath)
+		}
+	}
+
 	wwn, _ := common.VolumeIdGetWwn(req.GetVolumeId())
 	out, err := exec.Command("ls", "-l", fmt.Sprintf("/dev/disk/by-id/dm-name-3%s", wwn)).CombinedOutput()
 	klog.Infof("check for dm-name: ls -l %s, err = %v, out = \n%s", fmt.Sprintf("/dev/disk/by-id/dm-name-3%s", wwn), err, string(out))
