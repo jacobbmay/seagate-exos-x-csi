@@ -121,7 +121,7 @@ func TestUnpublishTargetDoesNotDetachAfterUnmountFailure(t *testing.T) {
 	}
 }
 
-func TestUnpublishFilesystemTargetPreservesExistingBehavior(t *testing.T) {
+func TestUnpublishTargetKeepsDeviceForAnotherFilesystemPublication(t *testing.T) {
 	inspectionCalls := 0
 	detachCalls := 0
 	err := unpublishTargetWithOperations(
@@ -140,7 +140,27 @@ func TestUnpublishFilesystemTargetPreservesExistingBehavior(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inspectionCalls != 0 || detachCalls != 1 {
+	if inspectionCalls != 1 || detachCalls != 0 {
 		t.Fatalf("unexpected calls: inspection=%d detach=%d", inspectionCalls, detachCalls)
+	}
+}
+
+func TestUnpublishTargetDetachesFinalFilesystemPublication(t *testing.T) {
+	detachCalls := 0
+	err := unpublishTargetWithOperations(
+		"/var/lib/kubelet/pods/pod-a/volumes/kubernetes.io~csi/pvc-test/mount",
+		func(string) error { return nil },
+		func(string) (bool, error) { return false, nil },
+		func() error {
+			detachCalls++
+			return nil
+		},
+	)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detachCalls != 1 {
+		t.Fatalf("expected one detach, got %d", detachCalls)
 	}
 }

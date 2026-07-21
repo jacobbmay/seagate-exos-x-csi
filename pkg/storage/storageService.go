@@ -249,40 +249,134 @@ func EnsureFsType(fsType string, disk string) error {
 }
 
 func MountFilesystem(req *csi.NodePublishVolumeRequest, path string) error {
-	fsType := GetFsType(req)
-	err := EnsureFsType(fsType, path)
+	return mountFilesystemWithOperations(req, path, filesystemMountOperations{
+		ensureFsType:    EnsureFsType,
+		checkFs:         CheckFs,
+		findMountpoints: findDeviceMountpoints,
+		prepareTarget:   prepareFilesystemTarget,
+		mountDevice:     mountFilesystemDevice,
+		bindMount:       bindMountFilesystem,
+		setReadOnly:     setBindMountReadOnly,
+		unmount:         Unmount,
+	})
+}
+
+type filesystemMountOperations struct {
+	ensureFsType    func(string, string) error
+	checkFs         func(string, string, string) error
+	findMountpoints func(string) ([]string, error)
+	prepareTarget   func(string) error
+	mountDevice     func(string, string, string) error
+	bindMount       func(string, string) error
+	setReadOnly     func(string, bool) error
+	unmount         func(string) error
+}
+
+func mountFilesystemWithOperations(req *csi.NodePublishVolumeRequest, devicePath string, operations filesystemMountOperations) error {
+	targetPath := filepath.Clean(req.GetTargetPath())
+	mountpoints, err := operations.findMountpoints(devicePath)
 	if err != nil {
 		return status.Error(codes.Internal, err.Error())
 	}
 
-	if err = CheckFs(path, fsType, "Publish"); err != nil {
-		return err
+	for _, mountpoint := range mountpoints {
+		if filepath.Clean(mountpoint) == targetPath {
+			klog.InfoS("volume already mounted", "targetPath", targetPath)
+			return nil
+		}
 	}
 
-	out, err := exec.Command("findmnt", "--output", "TARGET", "--noheadings", path).Output()
-	mountpoints := strings.Split(strings.Trim(string(out), "\n"), "\n")
-	if err != nil || len(mountpoints) == 0 {
-		klog.V(1).InfoS("mount", "command", fmt.Sprintf("mount -t %s %s %s", fsType, path, req.GetTargetPath()))
-		os.Mkdir(req.GetTargetPath(), 00755)
-		if _, err = os.Stat(path); errors.Is(err, os.ErrNotExist) {
-			klog.InfoS("targetpath does not exist", "targetPath", req.GetTargetPath())
-		}
-		out, err = exec.Command("mount", "-t", fsType, path, req.GetTargetPath()).CombinedOutput()
-		if err != nil {
-			return status.Error(codes.Internal, string(out))
-		}
-	} else if len(mountpoints) == 1 {
-		if mountpoints[0] == req.GetTargetPath() {
-			klog.InfoS("volume already mounted", "targetPath", req.GetTargetPath())
-		} else {
-			errStr := fmt.Sprintf("device has already been mounted somewhere else (%s instead of %s), please unmount first", mountpoints[0], req.GetTargetPath())
-			return status.Error(codes.Internal, errStr)
-		}
-	} else if len(mountpoints) > 1 {
-		return errors.New("device has already been mounted in several locations, please unmount first")
+	if err := operations.prepareTarget(targetPath); err != nil {
+		return status.Error(codes.Internal, err.Error())
 	}
 
-	klog.InfoS("successfully mounted volume", "targetPath", req.GetTargetPath())
+	if len(mountpoints) == 0 {
+		fsType := GetFsType(req)
+		if err := operations.ensureFsType(fsType, devicePath); err != nil {
+			return status.Error(codes.Internal, err.Error())
+		}
+		if err := operations.checkFs(devicePath, fsType, "Publish"); err != nil {
+			return err
+		}
+		if err := operations.mountDevice(devicePath, targetPath, fsType); err != nil {
+			return err
+		}
+		if req.GetReadonly() {
+			if err := operations.setReadOnly(targetPath, true); err != nil {
+				_ = operations.unmount(targetPath)
+				return err
+			}
+		}
+	} else {
+		// The filesystem is already mounted for another pod on this node.
+		// Bind-mount that filesystem into the new pod target instead of
+		// mounting the block device a second time.
+		sourcePath := filepath.Clean(mountpoints[0])
+		if err := operations.bindMount(sourcePath, targetPath); err != nil {
+			return err
+		}
+		if err := operations.setReadOnly(targetPath, req.GetReadonly()); err != nil {
+			_ = operations.unmount(targetPath)
+			return err
+		}
+	}
+
+	klog.InfoS("successfully mounted volume", "targetPath", targetPath)
+	return nil
+}
+
+func findDeviceMountpoints(devicePath string) ([]string, error) {
+	output, err := exec.Command("findmnt", "--output", "TARGET", "--noheadings", "--raw", devicePath).Output()
+	if err != nil {
+		if _, notFound := err.(*exec.ExitError); notFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find mounts for device %q: %w", devicePath, err)
+	}
+
+	var mountpoints []string
+	for _, line := range strings.Split(string(output), "\n") {
+		if mountpoint := strings.TrimSpace(line); mountpoint != "" {
+			mountpoints = append(mountpoints, mountpoint)
+		}
+	}
+	return mountpoints, nil
+}
+
+func prepareFilesystemTarget(targetPath string) error {
+	if err := os.MkdirAll(targetPath, 0755); err != nil {
+		return fmt.Errorf("create filesystem target %q: %w", targetPath, err)
+	}
+	return nil
+}
+
+func mountFilesystemDevice(devicePath, targetPath, fsType string) error {
+	klog.V(1).InfoS("mount filesystem device", "devicePath", devicePath, "targetPath", targetPath, "fsType", fsType)
+	output, err := exec.Command("mount", "-t", fsType, devicePath, targetPath).CombinedOutput()
+	if err != nil {
+		return status.Errorf(codes.Internal, "mount filesystem device: %s", strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func bindMountFilesystem(sourcePath, targetPath string) error {
+	klog.V(1).InfoS("bind mount filesystem", "sourcePath", sourcePath, "targetPath", targetPath)
+	output, err := exec.Command("mount", "--bind", sourcePath, targetPath).CombinedOutput()
+	if err != nil {
+		return status.Errorf(codes.Internal, "bind mount filesystem: %s", strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func setBindMountReadOnly(targetPath string, readOnly bool) error {
+	accessMode := "rw"
+	if readOnly {
+		accessMode = "ro"
+	}
+	output, err := exec.Command("mount", "-o", "remount,bind,"+accessMode, targetPath).CombinedOutput()
+	if err != nil {
+		return status.Errorf(codes.Internal, "set bind mount %s: %s", accessMode, strings.TrimSpace(string(output)))
+	}
 	return nil
 }
 
@@ -334,7 +428,7 @@ func Unmount(path string) error {
 func IsKubeletBlockVolumeTarget(path string) bool {
 	cleanPath := filepath.Clean(path)
 	marker := string(os.PathSeparator) + filepath.Join("plugins", "kubernetes.io", "csi", "volumeDevices", "publish") + string(os.PathSeparator)
-	markerIndex := strings.Index(cleanPath, marker)
+	markerIndex := strings.LastIndex(cleanPath, marker)
 	if markerIndex < 0 {
 		return false
 	}
@@ -349,6 +443,21 @@ func IsKubeletBlockVolumeTarget(path string) bool {
 // as a sibling beneath the same volumeDevices/publish directory.
 func HasOtherBlockVolumePublications(targetPath string) (bool, error) {
 	return hasOtherBlockVolumePublications(targetPath, isActiveBlockTarget)
+}
+
+// HasOtherVolumePublications checks kubelet's publication tree for another
+// active target of the same volume on this node. Unknown target layouts are
+// left to the storage-specific in-use checks during detach.
+func HasOtherVolumePublications(targetPath string) (bool, error) {
+	if IsKubeletBlockVolumeTarget(targetPath) {
+		return HasOtherBlockVolumePublications(targetPath)
+	}
+
+	podsRoot, volumeName, isFilesystemTarget := kubeletFilesystemTargetInfo(targetPath)
+	if !isFilesystemTarget {
+		return false, nil
+	}
+	return hasOtherFilesystemVolumePublications(targetPath, podsRoot, volumeName, isActiveMountTarget)
 }
 
 func hasOtherBlockVolumePublications(targetPath string, isActive func(string) (bool, error)) (bool, error) {
@@ -391,6 +500,76 @@ func isActiveBlockTarget(path string) (bool, error) {
 
 	mode := info.Mode()
 	return mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0, nil
+}
+
+func kubeletFilesystemTargetInfo(targetPath string) (podsRoot, volumeName string, ok bool) {
+	cleanPath := filepath.Clean(targetPath)
+	marker := string(os.PathSeparator) + "pods" + string(os.PathSeparator)
+	markerIndex := strings.LastIndex(cleanPath, marker)
+	if markerIndex < 0 {
+		return "", "", false
+	}
+
+	relativeTarget := cleanPath[markerIndex+len(marker):]
+	parts := strings.Split(relativeTarget, string(os.PathSeparator))
+	if len(parts) != 5 || parts[0] == "" || parts[1] != "volumes" || parts[2] != "kubernetes.io~csi" || parts[3] == "" || parts[4] != "mount" {
+		return "", "", false
+	}
+
+	podsRoot = cleanPath[:markerIndex] + marker[:len(marker)-1]
+	return podsRoot, parts[3], true
+}
+
+func hasOtherFilesystemVolumePublications(
+	targetPath, podsRoot, volumeName string,
+	isActive func(string) (bool, error),
+) (bool, error) {
+	cleanTarget := filepath.Clean(targetPath)
+	pods, err := os.ReadDir(podsRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect kubelet pod publications in %q: %w", podsRoot, err)
+	}
+
+	for _, pod := range pods {
+		if !pod.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(podsRoot, pod.Name(), "volumes", "kubernetes.io~csi", volumeName, "mount")
+		if candidate == cleanTarget {
+			continue
+		}
+
+		active, err := isActive(candidate)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return false, fmt.Errorf("inspect filesystem publication %q: %w", candidate, err)
+		}
+		if active {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func isActiveMountTarget(path string) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		return false, err
+	}
+
+	_, err := exec.Command("mountpoint", "--quiet", path).CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	if _, notMounted := err.(*exec.ExitError); notMounted {
+		return false, nil
+	}
+	return false, err
 }
 
 // IsMultipathDeviceOpen returns true when device-mapper reports one or more

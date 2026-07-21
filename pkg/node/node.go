@@ -264,7 +264,7 @@ func unpublishTarget(targetPath string, detach func() error) error {
 	return unpublishTargetWithOperations(
 		targetPath,
 		storage.Unmount,
-		storage.HasOtherBlockVolumePublications,
+		storage.HasOtherVolumePublications,
 		detach,
 	)
 }
@@ -272,24 +272,22 @@ func unpublishTarget(targetPath string, detach func() error) error {
 func unpublishTargetWithOperations(
 	targetPath string,
 	unmount func(string) error,
-	hasOtherBlockPublications func(string) (bool, error),
+	hasOtherPublications func(string) (bool, error),
 	detach func() error,
 ) error {
 	if err := unmount(targetPath); err != nil {
 		return err
 	}
 
-	if storage.IsKubeletBlockVolumeTarget(targetPath) {
-		hasOther, err := hasOtherBlockPublications(targetPath)
-		if err != nil {
-			// A failed inspection is not proof that the device is unused. Keep
-			// it attached so a cleanup retry cannot disrupt a live workload.
-			return err
-		}
-		if hasOther {
-			klog.InfoS("raw block volume still has another active publication; keeping storage attached", "targetPath", targetPath)
-			return nil
-		}
+	hasOther, err := hasOtherPublications(targetPath)
+	if err != nil {
+		// A failed inspection is not proof that the device is unused. Keep
+		// it attached so a cleanup retry cannot disrupt a live workload.
+		return err
+	}
+	if hasOther {
+		klog.InfoS("volume still has another active publication; keeping storage attached", "targetPath", targetPath)
+		return nil
 	}
 
 	return detach()
