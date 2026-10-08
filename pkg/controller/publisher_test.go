@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	storageapitypes "github.com/Seagate/seagate-exos-x-api-go/v2/pkg/common"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type fakeInitiatorRegistrationClient struct {
@@ -96,5 +98,73 @@ func TestInitiatorNicknameIsStableAndBounded(t *testing.T) {
 	}
 	if first == initiatorNickname(initiator+"-other") {
 		t.Fatal("different initiators produced the same nickname")
+	}
+}
+
+func TestRequireUnpublishInitiators(t *testing.T) {
+	tests := []struct {
+		name       string
+		initiators []string
+		lookupErr  error
+		wantCode   codes.Code
+	}{
+		{name: "lookup unavailable", lookupErr: errors.New("node service refused connection"), wantCode: codes.Unavailable},
+		{name: "empty result", wantCode: codes.FailedPrecondition},
+		{name: "empty initiator", initiators: []string{""}, wantCode: codes.FailedPrecondition},
+		{name: "valid initiator", initiators: []string{"iqn.1994-05.com.redhat:test"}, wantCode: codes.OK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := requireUnpublishInitiators("10.10.33.51", "iscsi", tt.initiators, tt.lookupErr)
+			if status.Code(err) != tt.wantCode {
+				t.Fatalf("status code = %s, want %s (error %v)", status.Code(err), tt.wantCode, err)
+			}
+			if tt.wantCode == codes.OK && len(got) != 1 {
+				t.Fatalf("valid initiators = %v, want one entry", got)
+			}
+		})
+	}
+}
+
+func TestValidateControllerUnmapResult(t *testing.T) {
+	tests := []struct {
+		name            string
+		apiStatus       *storageapitypes.ResponseStatus
+		unmapErr        error
+		wantAlreadyGone bool
+		wantCode        codes.Code
+	}{
+		{name: "success", wantCode: codes.OK},
+		{
+			name:            "array reports already unmapped",
+			apiStatus:       &storageapitypes.ResponseStatus{ReturnCode: storageapitypes.UnmapFailedErrorCode},
+			unmapErr:        errors.New("mapping does not exist"),
+			wantAlreadyGone: true,
+			wantCode:        codes.OK,
+		},
+		{
+			name:      "generic array error is not success",
+			apiStatus: &storageapitypes.ResponseStatus{ReturnCode: -1},
+			unmapErr:  errors.New("controller communication failed"),
+			wantCode:  codes.Internal,
+		},
+		{
+			name:     "transport error without status is not success",
+			unmapErr: errors.New("connection reset"),
+			wantCode: codes.Internal,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			alreadyGone, err := validateControllerUnmapResult("volume", "initiator", tt.apiStatus, tt.unmapErr)
+			if alreadyGone != tt.wantAlreadyGone {
+				t.Fatalf("already unmapped = %v, want %v", alreadyGone, tt.wantAlreadyGone)
+			}
+			if status.Code(err) != tt.wantCode {
+				t.Fatalf("status code = %s, want %s (error %v)", status.Code(err), tt.wantCode, err)
+			}
+		})
 	}
 }

@@ -41,14 +41,16 @@ func GetNodeInitiators(ctx context.Context, conn *grpc.ClientConn, reqType pb.In
 	return initiators.Initiators, nil
 }
 
-func NotifyUnmap(ctx context.Context, conn *grpc.ClientConn, volumeWWN string) (err error) {
+func NotifyUnmap(ctx context.Context, conn *grpc.ClientConn, volumeID string) (err error) {
 	client := pb.NewNodeServiceClient(conn)
-	unmappedVolumePb := pb.UnmappedVolume{VolumeName: volumeWWN}
+	// Keep using the existing protobuf field for wire compatibility. New peers
+	// send the augmented CSI volume ID; old peers may still send a raw WWN.
+	unmappedVolumePb := pb.UnmappedVolume{VolumeName: volumeID}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	_, err = client.NotifyUnmap(ctx, &unmappedVolumePb)
 	if err != nil {
-		klog.ErrorS(err, "Error during unmap notification", "unmappedVolumeName", volumeWWN)
+		klog.ErrorS(err, "Error during unmap notification", "unmappedVolumeID", volumeID)
 	}
 	return
 }

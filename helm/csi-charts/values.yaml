@@ -82,6 +82,10 @@ nodeLivenessProbe:
   # -- Extra arguments for the node's liveness probe containers
   extraArgs: []
 nodeServer:
+  # -- Priority class for the node plugin. Set this to system-node-critical so
+  # the CSI socket remains available while kubelet tears down workload volumes
+  # during node shutdown and transient resource pressure.
+  priorityClassName: ""
   # -- Kubernetes nodeSelector field for seagate-exos-x-csi-node-server Pod
   nodeSelector:
   # -- Kubernetes nodeAffinity field for seagate-exos-x-csi-node-server Pod

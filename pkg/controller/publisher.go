@@ -117,7 +117,6 @@ func (driver *Controller) ControllerUnpublishVolume(ctx context.Context, req *cs
 	}
 
 	volumeName, _ := common.VolumeIdGetName(req.GetVolumeId())
-	volumeWWN, _ := common.VolumeIdGetWwn(req.GetVolumeId())
 	nodeIP := req.GetNodeId()
 	storageProtocol, err := common.VolumeIdGetStorageProtocol(req.GetVolumeId())
 	if err != nil {
@@ -126,24 +125,76 @@ func (driver *Controller) ControllerUnpublishVolume(ctx context.Context, req *cs
 	}
 
 	initiators, err := driver.GetNodeInitiators(ctx, nodeIP, storageProtocol)
+	initiators, err = requireUnpublishInitiators(nodeIP, storageProtocol, initiators, err)
 	if err != nil {
-		klog.ErrorS(err, "error getting initiators from the node", "nodeIP", nodeIP, "storageProtocol", storageProtocol)
+		klog.ErrorS(err, "refusing to report controller unpublish success without node initiators",
+			"nodeIP", nodeIP, "storageProtocol", storageProtocol)
+		return nil, err
 	}
 
 	klog.InfoS("unmapping volume from initiator", "volumeName", volumeName, "initiators", initiators)
 	for _, initiator := range initiators {
-		status, err := driver.client.UnmapVolume(volumeName, initiator)
-		if err != nil {
-			if status != nil && status.ReturnCode == storageapitypes.UnmapFailedErrorCode {
-				klog.Info("unmap failed, assuming volume is already unmapped")
-			} else {
-				klog.Errorf("unknown error while unmapping initiator %s: %v", initiator, err)
-			}
-		} else {
-			driver.NotifyUnmap(ctx, nodeIP, volumeWWN)
+		apiStatus, unmapErr := driver.client.UnmapVolume(volumeName, initiator)
+		alreadyUnmapped, resultErr := validateControllerUnmapResult(volumeName, initiator, apiStatus, unmapErr)
+		if resultErr != nil {
+			return nil, resultErr
 		}
+		if alreadyUnmapped {
+			klog.InfoS("array reports volume is already unmapped", "volumeName", volumeName, "initiator", initiator)
+		}
+	}
+
+	// Array-side unmap can race late iSCSI discovery while a node is booting.
+	// Do not let the external-attacher remove its finalizer until the node has
+	// reconciled the exact volume identity and observed it stably absent. Pass
+	// the augmented ID so the node can select the protocol safely.
+	if err := driver.NotifyUnmap(ctx, nodeIP, req.GetVolumeId()); err != nil {
+		return nil, status.Errorf(codes.Aborted,
+			"array unmapped volume %s, but node %s has not completed post-unmap reconciliation: %v",
+			volumeName, nodeIP, err)
 	}
 
 	klog.Infof("successfully unmapped volume %s from all initiators", volumeName)
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
+}
+
+func validateControllerUnmapResult(
+	volumeName string,
+	initiator string,
+	apiStatus *storageapitypes.ResponseStatus,
+	unmapErr error,
+) (alreadyUnmapped bool, err error) {
+	if unmapErr == nil {
+		return false, nil
+	}
+	if apiStatus != nil && apiStatus.ReturnCode == storageapitypes.UnmapFailedErrorCode {
+		return true, nil
+	}
+	return false, status.Errorf(codes.Internal,
+		"failed to unmap volume %s from initiator %s: %v", volumeName, initiator, unmapErr)
+}
+
+// requireUnpublishInitiators prevents a node outage from turning detach into
+// false success. Without an initiator, the controller cannot issue any array
+// unmap request; returning success lets the external attacher remove the
+// VolumeAttachment even though the host mapping remains live.
+func requireUnpublishInitiators(nodeIP, storageProtocol string, initiators []string, lookupErr error) ([]string, error) {
+	if lookupErr != nil {
+		return nil, status.Errorf(codes.Unavailable,
+			"cannot retrieve %s initiators from node %s for controller unpublish: %v",
+			storageProtocol, nodeIP, lookupErr)
+	}
+	if len(initiators) == 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"node %s returned no %s initiators for controller unpublish",
+			nodeIP, storageProtocol)
+	}
+	for _, initiator := range initiators {
+		if initiator == "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"node %s returned an empty %s initiator for controller unpublish",
+				nodeIP, storageProtocol)
+		}
+	}
+	return initiators, nil
 }

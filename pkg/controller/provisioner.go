@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 
 	storageapi "github.com/Seagate/seagate-exos-x-api-go/v2/pkg/api"
@@ -15,6 +16,8 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 )
+
+const me5AllocationUnitBytes int64 = 4 * 1024 * 1024
 
 // Extract available SAS addresses for Nodes from topology segments
 // This will contain all SAS initiators for all nodes unless the storage class
@@ -72,7 +75,12 @@ func (controller *Controller) CreateVolume(ctx context.Context, req *csi.CreateV
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("CreateVolume Volume capabilities not valid: %v", err))
 	}
 
-	size := req.GetCapacityRange().GetRequiredBytes()
+	requiredBytes := req.GetCapacityRange().GetRequiredBytes()
+	limitBytes := req.GetCapacityRange().GetLimitBytes()
+	size, err := normalizeCreateCapacity(requiredBytes, limitBytes)
+	if err != nil {
+		return nil, err
+	}
 	sizeStr := getSizeStr(size)
 	pool := parameters[common.PoolConfigKey]
 	wwn := ""
@@ -124,12 +132,44 @@ func (controller *Controller) CreateVolume(ctx context.Context, req *csi.CreateV
 			}
 		}
 	}
-	if wwn == "" {
-		wwn, err = controller.client.GetVolumeWwn(volumeName)
-	}
+	backendVolumes, backendStatus, err := controller.client.ShowVolumes(volumeName)
 	if err != nil {
-		klog.ErrorS(err, "Error retrieving WWN of new volume", "volumeName", volumeName)
+		klog.ErrorS(err, "Error retrieving new volume", "volumeName", volumeName)
 		return nil, err
+	}
+	if backendStatus == nil || backendStatus.ResponseTypeNumeric != 0 {
+		return nil, status.Errorf(codes.Unknown, "storage array did not return a successful status for volume %q", volumeName)
+	}
+
+	var backendVolume *storageapitypes.VolumeObject
+	for i := range backendVolumes {
+		if backendVolumes[i].VolumeName == volumeName {
+			backendVolume = &backendVolumes[i]
+			break
+		}
+	}
+	if backendVolume == nil {
+		return nil, status.Errorf(codes.NotFound, "created volume %q was not returned by the storage array", volumeName)
+	}
+
+	actualBytes, err := volumeCapacityBytes(backendVolume.Blocks, backendVolume.BlockSize)
+	if err != nil {
+		return nil, status.Errorf(codes.Unknown, "invalid capacity returned for volume %q: %v", volumeName, err)
+	}
+	if actualBytes < requiredBytes {
+		return nil, status.Errorf(codes.OutOfRange,
+			"storage array returned %d bytes for volume %q, below required_bytes %d",
+			actualBytes, volumeName, requiredBytes)
+	}
+	if limitBytes > 0 && actualBytes > limitBytes {
+		return nil, status.Errorf(codes.OutOfRange,
+			"storage array returned %d bytes for volume %q, above limit_bytes %d",
+			actualBytes, volumeName, limitBytes)
+	}
+
+	wwn = backendVolume.Wwn
+	if wwn == "" {
+		return nil, status.Errorf(codes.Unknown, "storage array returned an empty WWN for volume %q", volumeName)
 	}
 
 	if storageProtocol == common.StorageProtocolISCSI {
@@ -153,16 +193,53 @@ func (controller *Controller) CreateVolume(ctx context.Context, req *csi.CreateV
 		Volume: &csi.Volume{
 			VolumeId:      volumeId,
 			VolumeContext: parameters,
-			CapacityBytes: req.GetCapacityRange().GetRequiredBytes(),
+			CapacityBytes: actualBytes,
 			ContentSource: req.GetVolumeContentSource(),
 		},
 	}
 
-	klog.Infof("created volume %s (%s)", volumeId, sizeStr)
+	klog.Infof("created volume %s (requested=%dB provisioned=%dB)", volumeId, requiredBytes, actualBytes)
 
 	// Log struct with field names
 	klog.V(8).Infof("created volume %+v", volume)
 	return volume, nil
+}
+
+func normalizeCreateCapacity(requiredBytes, limitBytes int64) (int64, error) {
+	if requiredBytes < 0 {
+		return 0, status.Error(codes.InvalidArgument, "required_bytes cannot be negative")
+	}
+	if limitBytes < 0 {
+		return 0, status.Error(codes.InvalidArgument, "limit_bytes cannot be negative")
+	}
+	if limitBytes > 0 && requiredBytes > limitBytes {
+		return 0, status.Error(codes.InvalidArgument, "required_bytes cannot exceed limit_bytes")
+	}
+
+	requestedBytes := requiredBytes
+	if requestedBytes == 0 {
+		requestedBytes = me5AllocationUnitBytes
+	}
+	if requestedBytes > math.MaxInt64-(me5AllocationUnitBytes-1) {
+		return 0, status.Error(codes.OutOfRange, "required_bytes is too large to align")
+	}
+
+	alignedBytes := ((requestedBytes + me5AllocationUnitBytes - 1) / me5AllocationUnitBytes) * me5AllocationUnitBytes
+	if limitBytes > 0 && alignedBytes > limitBytes {
+		return 0, status.Errorf(codes.OutOfRange,
+			"minimum aligned capacity %d exceeds limit_bytes %d", alignedBytes, limitBytes)
+	}
+	return alignedBytes, nil
+}
+
+func volumeCapacityBytes(blocks, blockSize int64) (int64, error) {
+	if blocks <= 0 || blockSize <= 0 {
+		return 0, fmt.Errorf("non-positive block geometry: blocks=%d block-size=%d", blocks, blockSize)
+	}
+	if blocks > math.MaxInt64/blockSize {
+		return 0, fmt.Errorf("block geometry overflows int64: blocks=%d block-size=%d", blocks, blockSize)
+	}
+	return blocks * blockSize, nil
 }
 
 // DeleteVolume deletes the given volume. The function is idempotent.

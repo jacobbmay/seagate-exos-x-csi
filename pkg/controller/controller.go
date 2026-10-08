@@ -36,13 +36,12 @@ var volumeCapabilities = []*csi.VolumeCapability{
 	},
 }
 
-var csiMutexes = map[string]*sync.Mutex{
-	"/csi.v1.Controller/CreateVolume":              {},
-	"/csi.v1.Controller/ControllerPublishVolume":   {},
-	"/csi.v1.Controller/DeleteVolume":              {},
-	"/csi.v1.Controller/ControllerUnpublishVolume": {},
-	"/csi.v1.Controller/ControllerExpandVolume":    {},
-}
+// The storage API client is shared by every controller RPC and configureClient
+// mutates its credentials, endpoints, generated client, and cached system
+// information. Serialize the complete authenticated RPC, not merely calls of
+// the same method, so an operation for one array cannot redirect an in-flight
+// operation for another array.
+var controllerRoutineMutex sync.Mutex
 
 var nonAuthenticatedMethods = []string{
 	"/csi.v1.Controller/ControllerGetCapabilities",
@@ -111,13 +110,7 @@ func NewWithTLSConfig(tlsConfig TLSConfig) (*Controller, error) {
 	}
 
 	controller.InitServer(
-		func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-			if mutex, exists := csiMutexes[info.FullMethod]; exists {
-				mutex.Lock()
-				defer mutex.Unlock()
-			}
-			return handler(ctx, req)
-		},
+		serializeAuthenticatedControllerRPCs(),
 		common.NewLogRoutineServerInterceptor(func(string) bool {
 			return true
 		}),
@@ -162,6 +155,25 @@ func NewWithTLSConfig(tlsConfig TLSConfig) (*Controller, error) {
 	}()
 
 	return controller, nil
+}
+
+func serializeAuthenticatedControllerRPCs() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		if methodNeedsAuthentication(info.FullMethod) {
+			controllerRoutineMutex.Lock()
+			defer controllerRoutineMutex.Unlock()
+		}
+		return handler(ctx, req)
+	}
+}
+
+func methodNeedsAuthentication(methodName string) bool {
+	for _, name := range nonAuthenticatedMethods {
+		if methodName == name {
+			return false
+		}
+	}
+	return true
 }
 
 func newStorageAPIHTTPClient(config TLSConfig) (*http.Client, error) {
@@ -260,15 +272,7 @@ func (controller *Controller) beginRoutine(ctx *DriverCtx, methodName string) er
 		return err
 	}
 
-	needsAuthentication := true
-	for _, name := range nonAuthenticatedMethods {
-		if methodName == name {
-			needsAuthentication = false
-			break
-		}
-	}
-
-	if !needsAuthentication {
+	if !methodNeedsAuthentication(methodName) {
 		return nil
 	}
 
@@ -400,7 +404,7 @@ func (controller *Controller) GetNodeInitiators(ctx context.Context, nodeAddress
 	return initiators, err
 }
 
-func (controller *Controller) NotifyUnmap(ctx context.Context, nodeAddress string, volumeWWN string) error {
+func (controller *Controller) NotifyUnmap(ctx context.Context, nodeAddress string, volumeID string) error {
 	clientConnection := controller.nodeServiceClients[nodeAddress]
 	if clientConnection == nil {
 		klog.V(3).InfoS("node grpc client not found, establishing...", "nodeAddress", nodeAddress)
@@ -411,7 +415,7 @@ func (controller *Controller) NotifyUnmap(ctx context.Context, nodeAddress strin
 		}
 		controller.nodeServiceClients[nodeAddress] = clientConnection
 	}
-	return node_service.NotifyUnmap(ctx, clientConnection, volumeWWN)
+	return node_service.NotifyUnmap(ctx, clientConnection, volumeID)
 }
 
 // Graceful shutdown of Node-Controller RPC Clients

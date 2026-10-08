@@ -203,6 +203,9 @@ func (node *Node) NodePublishVolume(ctx context.Context, req *csi.NodePublishVol
 	// Do any required device discovery and return path of the device on the node fs
 	path, err := storageNode.AttachStorage(ctx, req)
 	if err != nil {
+		if _, isStatusError := status.FromError(err); isStatusError {
+			return nil, err
+		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
